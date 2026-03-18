@@ -129,6 +129,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case streamItemMsg:
 		item := parser.StreamItem(msg)
+		// Accumulate token usage (includes history — shows total session cost)
 		if item.InputTokens > 0 {
 			m.totalInputTokens += item.InputTokens
 		}
