@@ -107,7 +107,10 @@ func ParseLine(line string) ([]StreamItem, error) {
 
 	var raw RawMessage
 	if err := json.Unmarshal([]byte(line), &raw); err != nil {
-		return nil, fmt.Errorf("failed to parse JSON: %w", err)
+		// Gracefully skip malformed/truncated lines (e.g. base64 images
+		// that exceeded the scanner buffer). A single bad line shouldn't
+		// crash the app.
+		return nil, nil
 	}
 
 	timestamp, err := time.Parse(time.RFC3339, raw.Timestamp)

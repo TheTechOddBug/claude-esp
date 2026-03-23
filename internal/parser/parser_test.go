@@ -21,12 +21,13 @@ func TestParseLine_EmptyLine(t *testing.T) {
 }
 
 func TestParseLine_InvalidJSON(t *testing.T) {
-	_, err := ParseLine("not json at all")
-	if err == nil {
-		t.Error("ParseLine with invalid JSON should return error")
+	// Invalid JSON should be silently skipped, not return an error
+	items, err := ParseLine("not json at all")
+	if err != nil {
+		t.Errorf("ParseLine should skip invalid JSON, got error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "failed to parse JSON") {
-		t.Errorf("error should mention JSON parsing, got: %v", err)
+	if len(items) != 0 {
+		t.Errorf("expected 0 items for invalid JSON, got %d", len(items))
 	}
 }
 
@@ -301,6 +302,47 @@ func TestFormatToolInput(t *testing.T) {
 				t.Errorf("formatToolInput(%q, %q) = %q, want substring %q", tt.toolName, tt.input, result, tt.wantSub)
 			}
 		})
+	}
+}
+
+func TestParseLine_UserMessageWithImage(t *testing.T) {
+	// User messages can contain image blocks (screenshots pasted into Claude Code)
+	// These should be silently skipped, not cause errors
+	line := `{"type":"user","timestamp":"2025-01-01T12:00:00Z","message":{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"}}]}}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("ParseLine should not error on image content, got: %v", err)
+	}
+	if len(items) != 0 {
+		t.Errorf("expected 0 items (images skipped), got %d", len(items))
+	}
+}
+
+func TestParseLine_UserMessageWithImageAndToolResult(t *testing.T) {
+	// A user message can contain both image blocks and tool results
+	line := `{"type":"user","timestamp":"2025-01-01T12:00:00Z","message":{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBOR"}},{"type":"tool_result","tool_use_id":"toolu_img1","content":"tool output here"}]}}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item (tool_result only), got %d", len(items))
+	}
+	if items[0].Content != "tool output here" {
+		t.Errorf("content = %q, want %q", items[0].Content, "tool output here")
+	}
+}
+
+func TestParseLine_TruncatedJSON(t *testing.T) {
+	// When a JSONL line exceeds the scanner buffer, it gets truncated
+	// producing invalid JSON. This should be skipped gracefully, not crash.
+	truncated := `{"type":"user","timestamp":"2025-01-01T12:00:00Z","message":{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"JVBER`
+	items, err := ParseLine(truncated)
+	if err != nil {
+		t.Fatalf("ParseLine should gracefully skip truncated JSON, got error: %v", err)
+	}
+	if len(items) != 0 {
+		t.Errorf("expected 0 items for truncated JSON, got %d", len(items))
 	}
 }
 

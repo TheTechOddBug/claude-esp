@@ -37,8 +37,10 @@ const (
 	FileReadBufferSize = 32 * 1024
 	// ScannerInitBufferSize is the initial buffer for JSON line scanner (64KB)
 	ScannerInitBufferSize = 64 * 1024
-	// ScannerMaxBufferSize is the max buffer for JSON line scanner (1MB)
-	ScannerMaxBufferSize = 1024 * 1024
+	// ScannerMaxBufferSize is the max buffer for JSON line scanner (10MB)
+	// Large because JSONL lines can contain base64-encoded images (screenshots).
+	// The scanner starts at ScannerInitBufferSize and only grows on demand.
+	ScannerMaxBufferSize = 10 * 1024 * 1024
 	// AgentIDDisplayLength is how many chars of agent ID to show in display name
 	AgentIDDisplayLength = 7
 	// RecentActivityThreshold is how recent a session must be to show as "active" in listings
