@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mattn/go-runewidth"
 	"github.com/phiat/claude-esp/internal/parser"
 )
 
@@ -208,6 +209,38 @@ func TestTruncateContent(t *testing.T) {
 	}
 	if !strings.Contains(resultLines[MaxLinesPerItem], "more lines") {
 		t.Errorf("last line should indicate truncation, got %q", resultLines[MaxLinesPerItem])
+	}
+}
+
+func TestTruncateContent_CJK(t *testing.T) {
+	s := NewStreamView()
+
+	// CJK characters are 3 bytes in UTF-8 but 2 display columns wide
+	// This should not panic and should wrap correctly
+	content := "# Step 5: 測試 focus-pane 回到原 pane"
+	result := s.truncateContent(content, 20)
+
+	// Should not panic, and each wrapped line should be <= 20 display columns
+	for _, line := range strings.Split(result, "\n") {
+		w := runewidth.StringWidth(line)
+		if w > 20 {
+			t.Errorf("wrapped line exceeds width 20: %q (display width %d)", line, w)
+		}
+	}
+}
+
+func TestTruncateContent_Emoji(t *testing.T) {
+	s := NewStreamView()
+
+	// Emoji are 4 bytes in UTF-8 but 2 display columns wide
+	content := "Hello 🔧🔧🔧🔧🔧🔧🔧🔧🔧🔧 world"
+	result := s.truncateContent(content, 15)
+
+	for _, line := range strings.Split(result, "\n") {
+		w := runewidth.StringWidth(line)
+		if w > 15 {
+			t.Errorf("wrapped line exceeds width 15: %q (display width %d)", line, w)
+		}
 	}
 }
 

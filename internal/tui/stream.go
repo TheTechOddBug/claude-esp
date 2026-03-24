@@ -3,8 +3,10 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/viewport"
+	"github.com/mattn/go-runewidth"
 	"github.com/phiat/claude-esp/internal/parser"
 )
 
@@ -275,14 +277,29 @@ func (s *StreamView) truncateContent(content string, width int) string {
 		lines = append(lines, mutedStyle.Render(fmt.Sprintf("... (%d more lines)", remaining)))
 	}
 
-	// Word wrap each line
+	// Word wrap each line using display width (handles CJK/emoji correctly)
 	var wrapped []string
 	for _, line := range lines {
-		if len(line) > width && width > 0 {
-			// Simple word wrap
-			for len(line) > width {
-				wrapped = append(wrapped, line[:width])
-				line = line[width:]
+		lineWidth := runewidth.StringWidth(line)
+		if lineWidth > width && width > 0 {
+			for runewidth.StringWidth(line) > width {
+				col := 0
+				splitAt := 0
+				for i, r := range line {
+					cw := runewidth.RuneWidth(r)
+					if col+cw > width {
+						break
+					}
+					col += cw
+					splitAt = i + len(string(r))
+				}
+				if splitAt == 0 {
+					// Single char wider than width — force advance past first rune
+					_, size := utf8.DecodeRuneInString(line)
+					splitAt = size
+				}
+				wrapped = append(wrapped, line[:splitAt])
+				line = line[splitAt:]
 			}
 			if len(line) > 0 {
 				wrapped = append(wrapped, line)
