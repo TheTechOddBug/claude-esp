@@ -940,6 +940,11 @@ func (w *Watcher) handleFsCreate(path string) {
 // created before the fsnotify watch was established. This closes the race window
 // where in-process agents write files between directory creation and watch setup.
 // All discovery handlers are idempotent, so duplicate calls are safe no-ops.
+//
+// When a parent directory (e.g. <sessionID>/) and its children (e.g. subagents/)
+// are created simultaneously (mkdir -p style), the CREATE event for the child
+// directory fires before we add a watch on the parent, so it is lost. Recursing
+// into subdirectories here ensures we add watches and scan those children too.
 func (w *Watcher) scanNewDirectory(path string) {
 	entries, err := os.ReadDir(path)
 	if err != nil {
@@ -948,12 +953,15 @@ func (w *Watcher) scanNewDirectory(path string) {
 
 	base := filepath.Base(path)
 	for _, entry := range entries {
+		fullPath := filepath.Join(path, entry.Name())
 		if entry.IsDir() {
+			// Add a watch and recurse: the CREATE event for this subdirectory
+			// may have been lost if it was created before the parent was watched.
+			w.fsWatcher.Add(fullPath)
+			w.scanNewDirectory(fullPath)
 			continue
 		}
 		name := entry.Name()
-		fullPath := filepath.Join(path, name)
-
 		switch {
 		case base == "subagents" && strings.HasSuffix(name, ".jsonl"):
 			w.handleNewSubagentFile(fullPath)
