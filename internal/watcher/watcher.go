@@ -1028,6 +1028,20 @@ func (w *Watcher) handleNewSessionFile(path string) {
 	case w.NewSession <- NewSessionMsg{SessionID: session.ID, ProjectPath: session.ProjectPath}:
 	default:
 	}
+
+	// buildSession may have found subagents that already existed on disk.
+	// Emit NewAgentMsg for each so the TUI shows them. Without this, the
+	// idempotency check in handleNewSubagentFile would suppress the message
+	// (the agent is already in session.Subagents but the TUI was never told).
+	session.mu.RLock()
+	for agentID := range session.Subagents {
+		agentType := session.SubagentTypes[agentID]
+		select {
+		case w.NewAgent <- NewAgentMsg{SessionID: session.ID, AgentID: agentID, AgentType: agentType}:
+		default:
+		}
+	}
+	session.mu.RUnlock()
 }
 
 // lookupAgentType returns the stored agent type for a given session/agent pair.
