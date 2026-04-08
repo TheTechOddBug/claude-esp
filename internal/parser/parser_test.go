@@ -370,3 +370,90 @@ func buildAssistantLine(t *testing.T, toolName, toolID string, inputJSON json.Ra
 	}
 	return string(data)
 }
+
+func TestParseLine_TokenUsageInAssistantMessage(t *testing.T) {
+	// Test that usage data is correctly extracted from assistant messages
+	line := `{"type":"assistant","timestamp":"2025-01-01T12:00:00Z","message":{"role":"assistant","content":[{"type":"text","text":"hello world"}],"usage":{"input_tokens":123,"output_tokens":456}}}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	item := items[0]
+	if item.InputTokens != 123 {
+		t.Errorf("InputTokens = %d, want 123", item.InputTokens)
+	}
+	if item.OutputTokens != 456 {
+		t.Errorf("OutputTokens = %d, want 456", item.OutputTokens)
+	}
+}
+
+func TestParseLine_MultipleBlocks_TokensOnFirstBlock(t *testing.T) {
+	// When an assistant message has multiple content blocks, tokens should be
+	// attached to the FIRST item only (not duplicated across all blocks)
+	line := `{"type":"assistant","timestamp":"2025-01-01T12:00:00Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"I think"},{"type":"text","text":"I respond"}],"usage":{"input_tokens":100,"output_tokens":200}}}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected 2 items, got %d", len(items))
+	}
+
+	// First item (thinking) should have token data
+	if items[0].InputTokens != 100 {
+		t.Errorf("items[0].InputTokens = %d, want 100", items[0].InputTokens)
+	}
+	if items[0].OutputTokens != 200 {
+		t.Errorf("items[0].OutputTokens = %d, want 200", items[0].OutputTokens)
+	}
+
+	// Second item (text) should NOT have token data
+	if items[1].InputTokens != 0 {
+		t.Errorf("items[1].InputTokens = %d, want 0 (tokens only on first item)", items[1].InputTokens)
+	}
+	if items[1].OutputTokens != 0 {
+		t.Errorf("items[1].OutputTokens = %d, want 0 (tokens only on first item)", items[1].OutputTokens)
+	}
+}
+
+func TestParseLine_NoUsageInMessage(t *testing.T) {
+	// Test that missing usage data results in 0 tokens
+	line := `{"type":"assistant","timestamp":"2025-01-01T12:00:00Z","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	item := items[0]
+	if item.InputTokens != 0 {
+		t.Errorf("InputTokens = %d, want 0", item.InputTokens)
+	}
+	if item.OutputTokens != 0 {
+		t.Errorf("OutputTokens = %d, want 0", item.OutputTokens)
+	}
+}
+
+func TestParseLine_UserMessageHasNoTokens(t *testing.T) {
+	// User messages should never have token data (they are not in the Anthropic API response)
+	line := `{"type":"user","timestamp":"2025-01-01T12:00:00Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_abc","content":"result data"}],"usage":{"input_tokens":999,"output_tokens":999}}}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	item := items[0]
+	// Even if usage is in the JSON, it should be ignored for user messages
+	if item.InputTokens != 0 {
+		t.Errorf("InputTokens = %d, want 0 (user messages don't have usage)", item.InputTokens)
+	}
+	if item.OutputTokens != 0 {
+		t.Errorf("OutputTokens = %d, want 0 (user messages don't have usage)", item.OutputTokens)
+	}
+}
