@@ -11,10 +11,12 @@ import (
 type StreamItemType string
 
 const (
-	TypeThinking   StreamItemType = "thinking"
-	TypeToolInput  StreamItemType = "tool_input"
-	TypeToolOutput StreamItemType = "tool_output"
-	TypeText       StreamItemType = "text"
+	TypeThinking     StreamItemType = "thinking"
+	TypeToolInput    StreamItemType = "tool_input"
+	TypeToolOutput   StreamItemType = "tool_output"
+	TypeText         StreamItemType = "text"
+	TypeTurnMarker   StreamItemType = "turn_marker"   // turn boundary + duration (system.turn_duration)
+	TypeSessionTitle StreamItemType = "session_title" // session label update (agent-name / custom-title)
 
 	// AgentIDDisplayLength is how many chars of agent ID to show in display name
 	AgentIDDisplayLength = 7
@@ -22,27 +24,36 @@ const (
 
 // StreamItem represents a single item in the output stream
 type StreamItem struct {
-	Type         StreamItemType
-	SessionID    string // which session this belongs to
-	AgentID      string // empty for main session, "abc123" for subagents
-	AgentName    string // human-readable name derived from agent type or ID
-	Timestamp    time.Time
-	Content      string
-	ToolName     string // for tool_input/tool_output
-	ToolID       string // to correlate input with output
-	DurationMs   int64  // tool execution duration in ms (0 = not available)
-	InputTokens  int64  // usage.input_tokens from assistant messages
-	OutputTokens int64  // usage.output_tokens from assistant messages
+	Type                StreamItemType
+	SessionID           string // which session this belongs to
+	AgentID             string // empty for main session, "abc123" for subagents
+	AgentName           string // human-readable name derived from agent type or ID
+	Timestamp           time.Time
+	Content             string
+	ToolName            string // for tool_input/tool_output
+	ToolID              string // to correlate input with output
+	DurationMs          int64  // tool execution duration in ms (0 = not available)
+	InputTokens         int64  // usage.input_tokens from assistant messages
+	OutputTokens        int64  // usage.output_tokens from assistant messages
+	CacheCreationTokens int64  // usage.cache_creation_input_tokens
+	CacheReadTokens     int64  // usage.cache_read_input_tokens
 }
 
 // RawMessage represents a line from the JSONL file
 type RawMessage struct {
 	Type          string          `json:"type"`
+	Subtype       string          `json:"subtype,omitempty"`
 	AgentID       string          `json:"agentId,omitempty"`
 	SessionID     string          `json:"sessionId"`
 	Timestamp     string          `json:"timestamp"`
+	DurationMs    int64           `json:"durationMs,omitempty"`
+	MessageCount  int             `json:"messageCount,omitempty"`
 	Message       json.RawMessage `json:"message"`
 	ToolUseResult json.RawMessage `json:"toolUseResult,omitempty"`
+	// AgentTitle and CustomTitle carry session-level labels on type="agent-name"
+	// and type="custom-title" lines respectively.
+	AgentTitle  string `json:"agentName,omitempty"`
+	CustomTitle string `json:"customTitle,omitempty"`
 }
 
 // RawToolUseResult represents the toolUseResult field on user messages
@@ -59,8 +70,10 @@ type AssistantMessage struct {
 
 // UsageInfo represents token usage from assistant messages
 type UsageInfo struct {
-	InputTokens  int64 `json:"input_tokens"`
-	OutputTokens int64 `json:"output_tokens"`
+	InputTokens              int64 `json:"input_tokens"`
+	OutputTokens             int64 `json:"output_tokens"`
+	CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
 }
 
 // ContentBlock represents a single content item in assistant response
@@ -89,14 +102,22 @@ type ToolResult struct {
 
 // ToolInput represents the input field for various tools
 type ToolInput struct {
-	Command     string `json:"command,omitempty"`
-	Description string `json:"description,omitempty"`
-	Pattern     string `json:"pattern,omitempty"`
-	Path        string `json:"path,omitempty"`
-	FilePath    string `json:"file_path,omitempty"`
-	Content     string `json:"content,omitempty"`
-	Prompt      string `json:"prompt,omitempty"`
-	Query       string `json:"query,omitempty"`
+	Command      string `json:"command,omitempty"`
+	Description  string `json:"description,omitempty"`
+	Pattern      string `json:"pattern,omitempty"`
+	Path         string `json:"path,omitempty"`
+	FilePath     string `json:"file_path,omitempty"`
+	Content      string `json:"content,omitempty"`
+	Prompt       string `json:"prompt,omitempty"`
+	Query        string `json:"query,omitempty"`
+	Skill        string `json:"skill,omitempty"`
+	Args         string `json:"args,omitempty"`
+	Reason       string `json:"reason,omitempty"`
+	DelaySeconds int64  `json:"delaySeconds,omitempty"`
+	Subject      string `json:"subject,omitempty"`
+	TaskID       string `json:"taskId,omitempty"`
+	TaskIDSnake  string `json:"task_id,omitempty"`
+	Cron         string `json:"cron,omitempty"`
 }
 
 // ParseLine parses a single JSONL line and returns stream items
@@ -125,9 +146,50 @@ func ParseLine(line string) ([]StreamItem, error) {
 		items = parseAssistantMessage(raw, timestamp)
 	case "user":
 		items = parseUserMessage(raw, timestamp)
+	case "system":
+		items = parseSystemMessage(raw, timestamp)
+	case "agent-name":
+		items = parseSessionTitle(raw, timestamp, raw.AgentTitle)
+	case "custom-title":
+		items = parseSessionTitle(raw, timestamp, raw.CustomTitle)
 	}
 
 	return items, nil
+}
+
+// parseSessionTitle emits a TypeSessionTitle item carrying a human-readable
+// label for the session. Both type="agent-name" (Claude's auto-generated
+// title) and type="custom-title" (user-set) map to this.
+func parseSessionTitle(raw RawMessage, timestamp time.Time, title string) []StreamItem {
+	if title == "" {
+		return nil
+	}
+	return []StreamItem{{
+		Type:      TypeSessionTitle,
+		SessionID: raw.SessionID,
+		Timestamp: timestamp,
+		Content:   title,
+	}}
+}
+
+// parseSystemMessage handles system-type JSONL lines. Currently surfaces only
+// subtype=turn_duration (emitted when a full assistant turn finishes) as a
+// subtle marker in the stream. Other subtypes are intentionally dropped.
+func parseSystemMessage(raw RawMessage, timestamp time.Time) []StreamItem {
+	if raw.Subtype != "turn_duration" {
+		return nil
+	}
+	agentName := "Main"
+	if raw.AgentID != "" {
+		agentName = fmt.Sprintf("Agent-%s", raw.AgentID[:min(AgentIDDisplayLength, len(raw.AgentID))])
+	}
+	return []StreamItem{{
+		Type:       TypeTurnMarker,
+		AgentID:    raw.AgentID,
+		AgentName:  agentName,
+		Timestamp:  timestamp,
+		DurationMs: raw.DurationMs,
+	}}
 }
 
 func parseAssistantMessage(raw RawMessage, timestamp time.Time) []StreamItem {
@@ -172,7 +234,7 @@ func parseAssistantMessage(raw RawMessage, timestamp time.Time) []StreamItem {
 				AgentName: agentName,
 				Timestamp: timestamp,
 				Content:   content,
-				ToolName:  block.Name,
+				ToolName:  PrettyToolName(block.Name),
 				ToolID:    block.ID,
 			})
 		}
@@ -182,6 +244,8 @@ func parseAssistantMessage(raw RawMessage, timestamp time.Time) []StreamItem {
 	if len(items) > 0 && msg.Usage != nil {
 		items[0].InputTokens = msg.Usage.InputTokens
 		items[0].OutputTokens = msg.Usage.OutputTokens
+		items[0].CacheCreationTokens = msg.Usage.CacheCreationInputTokens
+		items[0].CacheReadTokens = msg.Usage.CacheReadInputTokens
 	}
 
 	return items
@@ -293,10 +357,60 @@ func formatToolInput(toolName string, inputRaw json.RawMessage) string {
 		return input.Prompt
 	case "WebSearch":
 		return input.Query
-	case "Task":
+	case "Task", "Agent":
+		// "Task" is the legacy name; "Agent" is current (Claude Code 2.x).
+		if input.Description != "" {
+			return input.Description
+		}
 		return input.Prompt
+	case "Skill":
+		if input.Args != "" {
+			return fmt.Sprintf("%s — %s", input.Skill, input.Args)
+		}
+		return input.Skill
+	case "ToolSearch":
+		return input.Query
+	case "ScheduleWakeup":
+		if input.Reason != "" {
+			return input.Reason
+		}
+		if input.DelaySeconds > 0 {
+			return fmt.Sprintf("delay %ds", input.DelaySeconds)
+		}
+		return string(inputRaw)
+	case "TaskCreate":
+		return input.Subject
+	case "TaskUpdate":
+		if input.TaskID != "" {
+			return fmt.Sprintf("task %s", input.TaskID)
+		}
+		return string(inputRaw)
+	case "TaskStop":
+		return input.TaskIDSnake
+	case "EnterPlanMode":
+		return "(enter plan mode)"
+	case "ExitPlanMode":
+		return "(exit plan mode)"
+	case "CronCreate":
+		if input.Cron != "" && input.Prompt != "" {
+			return fmt.Sprintf("%s: %s", input.Cron, input.Prompt)
+		}
+		return string(inputRaw)
 	default:
-		// Return raw JSON for unknown tools
 		return string(inputRaw)
 	}
+}
+
+// PrettyToolName returns a display-friendly version of a tool name.
+// Long MCP names like mcp__plugin_context7_context7__query-docs are shortened
+// to mcp:query-docs; other names are returned unchanged.
+func PrettyToolName(name string) string {
+	if !strings.HasPrefix(name, "mcp__") {
+		return name
+	}
+	idx := strings.LastIndex(name, "__")
+	if idx <= len("mcp__")-2 || idx == len(name)-2 {
+		return name
+	}
+	return "mcp:" + name[idx+2:]
 }

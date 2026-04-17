@@ -223,6 +223,15 @@ func (s *StreamView) isItemEnabled(item parser.StreamItem) bool {
 }
 
 func (s *StreamView) renderItem(item parser.StreamItem, width int) string {
+	// Turn markers are a standalone single-line divider — no agent header,
+	// no trailing separator. Return early so the universal separator tail
+	// below doesn't double up.
+	if item.Type == parser.TypeTurnMarker {
+		dur := formatDuration(item.DurationMs)
+		text := fmt.Sprintf("── turn ended %s ──", dur)
+		return mutedStyle.Render(text)
+	}
+
 	var b strings.Builder
 
 	// Agent name styling

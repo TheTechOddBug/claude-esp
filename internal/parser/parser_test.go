@@ -266,13 +266,62 @@ func TestParseLine_EmptyThinking(t *testing.T) {
 }
 
 func TestParseLine_UnknownType(t *testing.T) {
-	line := `{"type":"system","timestamp":"2025-01-01T12:00:00Z","message":{}}`
+	// System messages with unrecognized subtypes should be silently dropped.
+	line := `{"type":"system","subtype":"something_else","timestamp":"2025-01-01T12:00:00Z","message":{}}`
 	items, err := ParseLine(line)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(items) != 0 {
-		t.Errorf("expected 0 items for unknown type, got %d", len(items))
+		t.Errorf("expected 0 items for unknown system subtype, got %d", len(items))
+	}
+}
+
+func TestParseLine_SessionTitleAgentName(t *testing.T) {
+	line := `{"type":"agent-name","agentName":"auto-collapse-feature","sessionId":"sess-1"}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 title item, got %d", len(items))
+	}
+	if items[0].Type != TypeSessionTitle {
+		t.Errorf("type = %q, want %q", items[0].Type, TypeSessionTitle)
+	}
+	if items[0].Content != "auto-collapse-feature" {
+		t.Errorf("content = %q, want auto-collapse-feature", items[0].Content)
+	}
+	if items[0].SessionID != "sess-1" {
+		t.Errorf("sessionID = %q, want sess-1", items[0].SessionID)
+	}
+}
+
+func TestParseLine_SessionTitleCustomTitle(t *testing.T) {
+	line := `{"type":"custom-title","customTitle":"my-custom-label","sessionId":"sess-2"}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 || items[0].Content != "my-custom-label" {
+		t.Fatalf("expected my-custom-label, got %+v", items)
+	}
+}
+
+func TestParseLine_TurnDuration(t *testing.T) {
+	line := `{"type":"system","subtype":"turn_duration","timestamp":"2025-01-01T12:00:00Z","durationMs":41751,"messageCount":42,"sessionId":"abc"}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 turn marker, got %d", len(items))
+	}
+	if items[0].Type != TypeTurnMarker {
+		t.Errorf("type = %q, want %q", items[0].Type, TypeTurnMarker)
+	}
+	if items[0].DurationMs != 41751 {
+		t.Errorf("duration = %d, want 41751", items[0].DurationMs)
 	}
 }
 
@@ -291,6 +340,20 @@ func TestFormatToolInput(t *testing.T) {
 		{"Glob no path", "Glob", `{"pattern":"*.go"}`, "*.go"},
 		{"Grep with path", "Grep", `{"pattern":"TODO","path":"/src"}`, "/TODO/ in /src"},
 		{"Grep no path", "Grep", `{"pattern":"TODO"}`, "/TODO/"},
+		{"Agent with desc", "Agent", `{"description":"audit deps","prompt":"check all deps"}`, "audit deps"},
+		{"Agent prompt fallback", "Agent", `{"prompt":"do a thing"}`, "do a thing"},
+		{"Task legacy alias", "Task", `{"description":"legacy task"}`, "legacy task"},
+		{"Skill with args", "Skill", `{"skill":"beads:create","args":"--title x"}`, "beads:create — --title x"},
+		{"Skill no args", "Skill", `{"skill":"beads:list"}`, "beads:list"},
+		{"ToolSearch", "ToolSearch", `{"query":"select:Read","max_results":1}`, "select:Read"},
+		{"ScheduleWakeup reason", "ScheduleWakeup", `{"delaySeconds":90,"reason":"watching build"}`, "watching build"},
+		{"ScheduleWakeup delay only", "ScheduleWakeup", `{"delaySeconds":90}`, "delay 90s"},
+		{"TaskCreate", "TaskCreate", `{"subject":"write docs","activeForm":"writing"}`, "write docs"},
+		{"TaskUpdate", "TaskUpdate", `{"taskId":"42","status":"in_progress"}`, "task 42"},
+		{"TaskStop", "TaskStop", `{"task_id":"abc123"}`, "abc123"},
+		{"EnterPlanMode", "EnterPlanMode", `{}`, "enter plan mode"},
+		{"ExitPlanMode", "ExitPlanMode", `{}`, "exit plan mode"},
+		{"CronCreate", "CronCreate", `{"cron":"*/5 * * * *","prompt":"ping","recurring":true}`, "*/5 * * * *"},
 		{"Unknown tool", "CustomTool", `{"foo":"bar"}`, `"foo"`},
 		{"Invalid JSON", "Bash", `not json`, "not json"},
 	}
@@ -435,6 +498,63 @@ func TestParseLine_NoUsageInMessage(t *testing.T) {
 	}
 	if item.OutputTokens != 0 {
 		t.Errorf("OutputTokens = %d, want 0", item.OutputTokens)
+	}
+}
+
+func TestPrettyToolName(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		{"Bash", "Bash"},
+		{"Read", "Read"},
+		{"Skill", "Skill"},
+		{"mcp__plugin_context7_context7__query-docs", "mcp:query-docs"},
+		{"mcp__context7__resolve", "mcp:resolve"},
+		{"mcp__claude_ai_Gmail__authenticate", "mcp:authenticate"},
+		{"mcp__weird", "mcp__weird"}, // no trailing __method — passthrough
+	}
+	for _, tt := range tests {
+		if got := PrettyToolName(tt.in); got != tt.want {
+			t.Errorf("PrettyToolName(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestParseLine_MCPToolUse_PrettifiesName(t *testing.T) {
+	line := `{"type":"assistant","timestamp":"2025-01-01T12:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"mcp__plugin_context7_context7__query-docs","input":{"library":"react"}}]}}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	if items[0].ToolName != "mcp:query-docs" {
+		t.Errorf("ToolName = %q, want %q", items[0].ToolName, "mcp:query-docs")
+	}
+}
+
+func TestParseLine_CacheTokensInAssistantMessage(t *testing.T) {
+	// cache_creation_input_tokens and cache_read_input_tokens are often much
+	// larger than the naked input_tokens, so undercounting them misleads users.
+	line := `{"type":"assistant","timestamp":"2025-01-01T12:00:00Z","message":{"role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":35656,"cache_read_input_tokens":1234}}}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	item := items[0]
+	if item.CacheCreationTokens != 35656 {
+		t.Errorf("CacheCreationTokens = %d, want 35656", item.CacheCreationTokens)
+	}
+	if item.CacheReadTokens != 1234 {
+		t.Errorf("CacheReadTokens = %d, want 1234", item.CacheReadTokens)
+	}
+	// existing fields still correct
+	if item.InputTokens != 10 || item.OutputTokens != 5 {
+		t.Errorf("Input/Output = %d/%d, want 10/5", item.InputTokens, item.OutputTokens)
 	}
 }
 
