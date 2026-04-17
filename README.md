@@ -69,6 +69,7 @@ claude-esp
 | `-p <ms>`  | Poll interval in ms (fallback mode only, default 500) |
 | `-w <dur>` | Active window duration (default `5m`, e.g. `30s`, `2m`) |
 | `-m <N>`   | Max sessions to show in tree (default 0 = unlimited) |
+| `-c <dur>` | Auto-collapse sessions inactive ≥ dur (default 0 = disabled, e.g. `2m`) |
 | `-v`       | Show version                                  |
 | `-h`       | Show help                                     |
 
@@ -113,11 +114,24 @@ claude-esp -l
 | `A`       | Toggle auto-discovery of new sessions     |
 | `tab`     | Switch focus between tree and stream      |
 | `j/k/↑/↓` | Navigate tree or scroll stream            |
-| `space`   | Toggle selected item in tree              |
+| `space`   | On session: collapse/expand (pins on manual expand) · On agent: toggle visibility |
 | `s`       | Solo selected session/agent (toggle)      |
 | `enter`   | Load background task output (when selected)|
 | `g/G`     | Go to top/bottom of stream                |
 | `q`       | Quit                                      |
+
+## Auto-Collapse
+
+Run with `-c 2m` to automatically collapse sessions that have been idle for 2
+minutes. Collapsed sessions show `▸` instead of `▾` in the tree and display the
+count of hidden subagents (e.g. `📂▸ my-session (+2)`). Children of collapsed
+sessions are also filtered out of the stream pane — the whole point is to stop
+sleeping sessions from dominating your view.
+
+Press `space` on a collapsed session to expand it manually. Manual expansion
+**pins** the session — it won't auto-collapse again until it wakes up (receives
+new activity) and then goes idle once more. Press `s` to solo a session; if
+it's collapsed, Solo force-expands and pins it so you can see its output.
 
 ## How It Works
 

@@ -422,9 +422,10 @@ func (w *Watcher) IsAutoDiscoveryEnabled() bool {
 
 // ActivityInfo contains activity status for a session/agent
 type ActivityInfo struct {
-	SessionID string
-	AgentID   string // empty for main
-	IsActive  bool
+	SessionID    string
+	AgentID      string // empty for main
+	IsActive     bool
+	LastModified time.Time // file mod time — used to drive auto-collapse policy
 }
 
 // GetActivityInfo returns activity status for all watched sessions and agents
@@ -440,9 +441,10 @@ func (w *Watcher) GetActivityInfo(activeWithin time.Duration) []ActivityInfo {
 		// Check main file
 		if fi, err := os.Stat(session.MainFile); err == nil {
 			info = append(info, ActivityInfo{
-				SessionID: session.ID,
-				AgentID:   "",
-				IsActive:  now.Sub(fi.ModTime()) < activeWithin,
+				SessionID:    session.ID,
+				AgentID:      "",
+				IsActive:     now.Sub(fi.ModTime()) < activeWithin,
+				LastModified: fi.ModTime(),
 			})
 		}
 
@@ -451,9 +453,10 @@ func (w *Watcher) GetActivityInfo(activeWithin time.Duration) []ActivityInfo {
 		for agentID, path := range session.Subagents {
 			if fi, err := os.Stat(path); err == nil {
 				info = append(info, ActivityInfo{
-					SessionID: session.ID,
-					AgentID:   agentID,
-					IsActive:  now.Sub(fi.ModTime()) < activeWithin,
+					SessionID:    session.ID,
+					AgentID:      agentID,
+					IsActive:     now.Sub(fi.ModTime()) < activeWithin,
+					LastModified: fi.ModTime(),
 				})
 			}
 		}
@@ -684,13 +687,13 @@ func formatToolName(toolName string, line string) string {
 		}
 	}
 
-	// For Task, try to get description
-	if toolName == "Task" {
+	// Task (legacy) and Agent (current name) both carry a "description" field
+	if toolName == "Task" || toolName == "Agent" {
 		if desc := extractField(line, "description"); desc != "" {
 			if len(desc) > 30 {
 				desc = desc[:30] + "..."
 			}
-			return "Task: " + desc
+			return toolName + ": " + desc
 		}
 	}
 

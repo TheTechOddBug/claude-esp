@@ -24,7 +24,7 @@ import (
 )
 
 var (
-	version = "0.4.7"
+	version = "0.5.0"
 )
 
 func main() {
@@ -36,6 +36,7 @@ func main() {
 	pollMs := flag.Int("p", 500, "Poll interval in milliseconds (min 100)")
 	activeWindowStr := flag.String("w", "5m", "Active window duration (e.g. 30s, 2m, 5m)")
 	maxSessions := flag.Int("m", 0, "Max sessions to show in tree (0=unlimited)")
+	collapseAfterStr := flag.String("c", "0", "Auto-collapse sessions inactive ≥ this duration (0=disabled, e.g. 2m)")
 	showVersion := flag.Bool("v", false, "Show version")
 	showHelp := flag.Bool("h", false, "Show help")
 
@@ -56,6 +57,16 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Invalid active window duration %q: %v\n", *activeWindowStr, err)
 		os.Exit(1)
+	}
+
+	// Parse collapse-after duration (0 = disabled)
+	var collapseAfter time.Duration
+	if *collapseAfterStr != "0" && *collapseAfterStr != "" {
+		collapseAfter, err = time.ParseDuration(*collapseAfterStr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Invalid collapse duration %q: %v\n", *collapseAfterStr, err)
+			os.Exit(1)
+		}
 	}
 
 	if *listActive {
@@ -103,7 +114,7 @@ func main() {
 	}
 
 	// Run TUI
-	model := tui.NewModel(*sessionID, *skipHistory, pollInterval, activeWindow, *maxSessions)
+	model := tui.NewModel(*sessionID, *skipHistory, pollInterval, activeWindow, *maxSessions, collapseAfter)
 	p := tea.NewProgram(model, tea.WithAltScreen())
 
 	if _, err := p.Run(); err != nil {
@@ -139,6 +150,7 @@ OPTIONS:
     -p <ms>     Poll interval in ms, fallback mode only (default 500, min 100)
     -w <dur>    Active window duration (default 5m, e.g. 30s, 2m, 10m)
     -m <N>      Max sessions to show in tree (default 0=unlimited)
+    -c <dur>    Auto-collapse sessions inactive ≥ dur (0=disabled, e.g. 2m, 30s)
     -v          Show version
     -h          Show this help
 
@@ -155,7 +167,7 @@ KEYBINDINGS:
     x/d         Remove selected session (in tree)
     tab         Switch focus between tree and stream
     j/k         Navigate (tree) or scroll (stream)
-    space       Toggle agent visibility (in tree)
+    space       On agent: toggle visibility · On session: collapse/expand (pins on manual expand)
     g/G         Go to top/bottom of stream
     q           Quit
 

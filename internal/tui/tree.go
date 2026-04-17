@@ -38,6 +38,13 @@ type TreeNode struct {
 	ParentAgentID string // which agent spawned this task (empty = main)
 	OutputPath    string // path to tool-results file
 	IsComplete    bool   // whether the task has finished
+
+	// Session-only collapse state (used by -c / auto-collapse feature).
+	// Collapsed: children are hidden from tree navigation and stream filtering.
+	// Pinned: user manually expanded this session; suppress auto-collapse until
+	// the session wakes up again.
+	Collapsed bool
+	Pinned    bool
 }
 
 // TreeView manages the tree of sessions and agents
@@ -256,6 +263,11 @@ func (t *TreeView) rebuildNodeList() {
 
 func (t *TreeView) flattenNode(node *TreeNode, depth int) {
 	t.nodes = append(t.nodes, node)
+	// Collapsed sessions hide their children from navigation AND from the
+	// stream's enabled-filter set (GetEnabledFilters walks t.nodes).
+	if node.Type == NodeTypeSession && node.Collapsed {
+		return
+	}
 	for _, child := range node.Children {
 		t.flattenNode(child, depth+1)
 	}
@@ -275,23 +287,36 @@ func (t *TreeView) MoveDown() {
 	}
 }
 
-// Toggle toggles the enabled state of current node
+// Toggle toggles the current node's visibility.
+//
+// On a session node, space collapses/expands (hides children in the tree and
+// filters them from the stream). Manually expanding pins the session so
+// auto-collapse won't re-collapse it until the session wakes again.
+//
+// On Main/Agent/BackgroundTask nodes, space toggles the node's enabled state
+// (shows/hides that specific agent's output).
 func (t *TreeView) Toggle() {
-	if t.cursor >= 0 && t.cursor < len(t.nodes) {
-		node := t.nodes[t.cursor]
-		node.Enabled = !node.Enabled
-
-		// If toggling a session, toggle all children too
-		if node.Type == NodeTypeSession {
-			for _, child := range node.Children {
-				child.Enabled = node.Enabled
-			}
-		}
+	if t.cursor < 0 || t.cursor >= len(t.nodes) {
+		return
 	}
+	node := t.nodes[t.cursor]
+	if node.Type == NodeTypeSession {
+		node.Collapsed = !node.Collapsed
+		if !node.Collapsed {
+			node.Pinned = true
+		}
+		t.rebuildNodeList()
+		return
+	}
+	node.Enabled = !node.Enabled
 }
 
 // Solo isolates the selected node: disables all others, enables only this one.
 // If already soloed, re-enables all.
+//
+// If the target is a collapsed session, Solo force-expands it first (and
+// pins) — the whole point of soloing is to see that session's output, which
+// means its children must be visible in the tree and routed to the stream.
 func (t *TreeView) Solo() {
 	if t.cursor < 0 || t.cursor >= len(t.nodes) {
 		return
@@ -305,6 +330,14 @@ func (t *TreeView) Solo() {
 		// Disable all sessions and their children
 		for _, session := range t.Root.Children {
 			setAllEnabled(session, false)
+		}
+
+		// If soloing onto a collapsed session, expand it first so its
+		// children can be enabled and shown in the stream.
+		if selected.Type == NodeTypeSession && selected.Collapsed {
+			selected.Collapsed = false
+			selected.Pinned = true
+			defer t.rebuildNodeList()
 		}
 
 		// Enable the selected node and the path to it
@@ -364,6 +397,82 @@ func (t *TreeView) GetSelectedSession() string {
 		return node.SessionID
 	}
 	return ""
+}
+
+// SetCollapsed updates a session's collapse state. When collapsing, if the
+// cursor was pointing at a now-hidden child, it jumps up to the session row
+// so the user doesn't lose their position entirely. Setting collapsed=false
+// does NOT set Pinned — the caller decides (auto-wake vs user Toggle).
+func (t *TreeView) SetCollapsed(sessionID string, collapsed bool) {
+	for _, session := range t.Root.Children {
+		if session.Type != NodeTypeSession || session.ID != sessionID {
+			continue
+		}
+		if session.Collapsed == collapsed {
+			return
+		}
+		cursorNode := t.GetSelectedNode()
+		session.Collapsed = collapsed
+		t.rebuildNodeList()
+		// If the cursor was inside the subtree that just got hidden, move it
+		// up to the session row. Otherwise leave it alone — rebuildNodeList
+		// already clamps it to a valid range.
+		if collapsed && cursorNode != nil && cursorNode != session {
+			if t.nodeInSubtree(cursorNode, session) {
+				for i, n := range t.nodes {
+					if n == session {
+						t.cursor = i
+						break
+					}
+				}
+			}
+		}
+		return
+	}
+}
+
+// SetPinned sets the user-pinned flag on a session. Pinned sessions are
+// exempted from auto-collapse until they next wake up.
+func (t *TreeView) SetPinned(sessionID string, pinned bool) {
+	for _, session := range t.Root.Children {
+		if session.Type == NodeTypeSession && session.ID == sessionID {
+			session.Pinned = pinned
+			return
+		}
+	}
+}
+
+// nodeInSubtree returns true if needle appears anywhere in root's subtree.
+func (t *TreeView) nodeInSubtree(needle, root *TreeNode) bool {
+	if root == needle {
+		return true
+	}
+	for _, c := range root.Children {
+		if t.nodeInSubtree(needle, c) {
+			return true
+		}
+	}
+	return false
+}
+
+// SetSessionTitle updates the display name of a session node. Used when the
+// JSONL stream reports an agent-name or custom-title for the session, giving
+// users a human-readable label instead of the project path. Length is capped
+// so narrow tree panes don't overflow; the raw project name (25 char cap) was
+// the prior default, so we keep the same ceiling here.
+func (t *TreeView) SetSessionTitle(sessionID, title string) {
+	if title == "" {
+		return
+	}
+	for _, child := range t.Root.Children {
+		if child.Type == NodeTypeSession && child.ID == sessionID {
+			if len(title) > 25 {
+				title = title[:25]
+			}
+			child.Name = title
+			return
+		}
+	}
 }
 
 // RemoveSession removes a session and all its children from the tree
@@ -528,10 +637,14 @@ func (t *TreeView) View() string {
 		icon := ""
 		switch node.Type {
 		case NodeTypeSession:
+			arrow := "▾"
+			if node.Collapsed {
+				arrow = "▸"
+			}
 			if node.IsActive {
-				icon = "📁 "
+				icon = "📁" + arrow + " "
 			} else {
-				icon = "📂 "
+				icon = "📂" + arrow + " "
 			}
 		case NodeTypeMain:
 			if node.IsActive {
@@ -555,6 +668,19 @@ func (t *TreeView) View() string {
 
 		// Build line with name (muted if inactive)
 		name := node.Name
+		// Collapsed sessions show a hidden-agent count so users don't lose
+		// the signal that subagents exist underneath the collapsed node.
+		if node.Type == NodeTypeSession && node.Collapsed {
+			agents := 0
+			for _, c := range node.Children {
+				if c.Type == NodeTypeAgent {
+					agents++
+				}
+			}
+			if agents > 0 {
+				name = fmt.Sprintf("%s (+%d)", name, agents)
+			}
+		}
 		if !node.IsActive && node.Type != NodeTypeSession {
 			name = mutedStyle.Render(node.Name)
 		}

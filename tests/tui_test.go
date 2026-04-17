@@ -348,20 +348,36 @@ func TestFilters(t *testing.T) {
 }
 
 func TestTreeInteract(t *testing.T) {
+	// Space on a session node collapses (▾ → ▸). Space on a Main/Agent node
+	// flips its Enabled checkbox (☑ → ☐). Verify both.
 	s := espStart(t, 120, 40)
 	defer s.stop()
 
-	s.key("\t") // focus tree
-	time.Sleep(200 * time.Millisecond)
+	s.key("\t") // focus tree; cursor starts at session row
 
+	// 1) Space on session → collapse, arrow becomes ▸.
 	s.use()
-	exec.Command("tui-use", "type", " ").Run() // uncheck
+	exec.Command("tui-use", "type", " ").Run()
 	time.Sleep(400 * time.Millisecond)
-
 	screen := s.snap()
-	has(t, screen, "☐", "unchecked")
+	has(t, screen, "▸", "collapsed arrow")
+
+	// Space again → expand (pins), arrow back to ▾.
+	s.use()
+	exec.Command("tui-use", "type", " ").Run()
+	time.Sleep(400 * time.Millisecond)
+	screen = s.snap()
+	has(t, screen, "▾", "expanded arrow")
+
+	// 2) j to Main, then space → checkbox ☑ → ☐.
+	s.key("j")
+	s.use()
+	exec.Command("tui-use", "type", " ").Run()
+	time.Sleep(400 * time.Millisecond)
+	screen = s.snap()
+	has(t, screen, "☐", "main unchecked")
 
 	s.use()
-	exec.Command("tui-use", "type", " ").Run() // recheck
+	exec.Command("tui-use", "type", " ").Run()
 	time.Sleep(400 * time.Millisecond)
 }

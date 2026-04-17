@@ -22,38 +22,44 @@ const (
 
 // Model is the main TUI model
 type Model struct {
-	tree              *TreeView
-	stream            *StreamView
-	watcher           *watcher.Watcher
-	focus             Focus
-	showTree          bool
-	width             int
-	height            int
-	treeWidth         int
-	sessionID         string
-	skipHistory       bool
-	pollInterval      time.Duration
-	activeWindow      time.Duration
-	maxSessions       int
-	err               error
-	quitting          bool
-	totalInputTokens  int64
-	totalOutputTokens int64
+	tree               *TreeView
+	stream             *StreamView
+	watcher            *watcher.Watcher
+	focus              Focus
+	showTree           bool
+	width              int
+	height             int
+	treeWidth          int
+	sessionID          string
+	skipHistory        bool
+	pollInterval       time.Duration
+	activeWindow       time.Duration
+	maxSessions        int
+	collapseAfter      time.Duration // 0 = disabled
+	err                error
+	quitting           bool
+	totalInputTokens   int64
+	totalOutputTokens  int64
+	totalCacheCreation int64
+	totalCacheRead     int64
 }
 
-// NewModel creates a new TUI model
-func NewModel(sessionID string, skipHistory bool, pollInterval time.Duration, activeWindow time.Duration, maxSessions int) *Model {
+// NewModel creates a new TUI model. If collapseAfter > 0, sessions inactive
+// for that duration will auto-collapse in the tree (and be hidden from the
+// stream). See tree.Toggle / Solo for the interactive counterpart.
+func NewModel(sessionID string, skipHistory bool, pollInterval time.Duration, activeWindow time.Duration, maxSessions int, collapseAfter time.Duration) *Model {
 	return &Model{
-		tree:         NewTreeView(),
-		stream:       NewStreamView(),
-		focus:        FocusStream,
-		showTree:     true,
-		treeWidth:    25,
-		sessionID:    sessionID,
-		skipHistory:  skipHistory,
-		pollInterval: pollInterval,
-		activeWindow: activeWindow,
-		maxSessions:  maxSessions,
+		tree:          NewTreeView(),
+		stream:        NewStreamView(),
+		focus:         FocusStream,
+		showTree:      true,
+		treeWidth:     25,
+		sessionID:     sessionID,
+		skipHistory:   skipHistory,
+		pollInterval:  pollInterval,
+		activeWindow:  activeWindow,
+		maxSessions:   maxSessions,
+		collapseAfter: collapseAfter,
 	}
 }
 
@@ -133,12 +139,23 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case streamItemMsg:
 		item := parser.StreamItem(msg)
+		// Session-title items update the tree label, not the stream.
+		if item.Type == parser.TypeSessionTitle {
+			m.tree.SetSessionTitle(item.SessionID, item.Content)
+			break
+		}
 		// Accumulate token usage (includes history — shows total session cost)
 		if item.InputTokens > 0 {
 			m.totalInputTokens += item.InputTokens
 		}
 		if item.OutputTokens > 0 {
 			m.totalOutputTokens += item.OutputTokens
+		}
+		if item.CacheCreationTokens > 0 {
+			m.totalCacheCreation += item.CacheCreationTokens
+		}
+		if item.CacheReadTokens > 0 {
+			m.totalCacheRead += item.CacheReadTokens
 		}
 		m.stream.AddItem(item)
 		m.stream.SetEnabledFilters(m.tree.GetEnabledFilters())
@@ -280,9 +297,52 @@ func (m *Model) updateActivityStatus() {
 	if m.watcher == nil {
 		return
 	}
-	// Check activity within last 30 seconds
-	for _, info := range m.watcher.GetActivityInfo(30 * time.Second) {
+	// Check activity within last 30 seconds. Gather infos once so the collapse
+	// policy sees the same snapshot.
+	infos := m.watcher.GetActivityInfo(30 * time.Second)
+	for _, info := range infos {
 		m.tree.UpdateActivity(info.SessionID, info.AgentID, info.IsActive)
+	}
+	if m.collapseAfter > 0 {
+		m.applyCollapsePolicy(infos)
+	}
+}
+
+// applyCollapsePolicy auto-collapses sessions whose newest-modified file is
+// older than collapseAfter. A session wakes up (LastModified is recent) →
+// any user-set Pin is cleared so the next sleep cycle re-auto-collapses.
+// This is the "pin resets on wake" semantic discussed in issue #5 Option D.
+func (m *Model) applyCollapsePolicy(infos []watcher.ActivityInfo) {
+	// Find newest LastModified across main + all agents per session.
+	latest := map[string]time.Time{}
+	for _, info := range infos {
+		if t, ok := latest[info.SessionID]; !ok || info.LastModified.After(t) {
+			latest[info.SessionID] = info.LastModified
+		}
+	}
+
+	now := time.Now()
+	for _, node := range m.tree.Root.Children {
+		if node.Type != NodeTypeSession {
+			continue
+		}
+		lastMod, ok := latest[node.ID]
+		if !ok {
+			continue
+		}
+
+		sessionActive := now.Sub(lastMod) < 30*time.Second
+		if sessionActive {
+			// Woke up: clear any prior pin so the next sleep cycle auto-collapses.
+			if node.Pinned {
+				m.tree.SetPinned(node.ID, false)
+			}
+			continue
+		}
+
+		if now.Sub(lastMod) >= m.collapseAfter && !node.Collapsed && !node.Pinned {
+			m.tree.SetCollapsed(node.ID, true)
+		}
 	}
 }
 
@@ -460,12 +520,18 @@ func (m *Model) renderHeader() string {
 		}
 	}
 
-	// Token usage display
+	// Token usage display (in / out / cache write+read)
 	tokenInfo := ""
-	if m.totalInputTokens > 0 || m.totalOutputTokens > 0 {
+	if m.totalInputTokens > 0 || m.totalOutputTokens > 0 ||
+		m.totalCacheCreation > 0 || m.totalCacheRead > 0 {
 		tokenInfo = fmt.Sprintf("│ %s in / %s out",
 			formatTokenCount(m.totalInputTokens),
 			formatTokenCount(m.totalOutputTokens))
+		if m.totalCacheCreation > 0 || m.totalCacheRead > 0 {
+			tokenInfo += fmt.Sprintf(" / %s+%s cache",
+				formatTokenCount(m.totalCacheCreation),
+				formatTokenCount(m.totalCacheRead))
+		}
 	}
 
 	// Build header - use plain text and apply headerStyle uniformly (like Rust version)
