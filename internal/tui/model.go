@@ -286,6 +286,19 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	case "x":
 		m.stream.ToggleText()
 
+	case "d":
+		// Remove the selected session from the tree and the watcher. The
+		// watcher remembers the ID so auto-discovery doesn't re-add it.
+		if m.focus == FocusTree {
+			if sessionID := m.tree.GetSelectedSession(); sessionID != "" {
+				m.tree.RemoveSession(sessionID)
+				if m.watcher != nil {
+					m.watcher.RemoveSession(sessionID)
+				}
+				m.stream.SetEnabledFilters(m.tree.GetEnabledFilters())
+			}
+		}
+
 	case "s":
 		if m.focus == FocusTree {
 			m.tree.Solo()
@@ -613,7 +626,7 @@ func (m *Model) renderStreamOnly() string {
 func (m *Model) renderHelp() string {
 	var help string
 	if m.focus == FocusTree {
-		help = "j/k: navigate │ space: toggle │ s: solo │ A: auto-discover │ q: quit"
+		help = "j/k: navigate │ space: toggle │ s: solo │ d: remove │ A: auto-discover │ q: quit"
 	} else {
 		help = "j/k: scroll │ g/G: top/bottom │ A: auto-discover │ tab: tree │ q: quit"
 	}
