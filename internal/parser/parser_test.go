@@ -1321,12 +1321,142 @@ func TestFormatToolInput_NewTools(t *testing.T) {
 		{"Artifact redeploy to url", "Artifact", `{"file_path":"/tmp/s/m.html","url":"https://claude.ai/code/artifact/abc"}`, "publish /tmp/s/m.html → https://claude.ai/code/artifact/abc"},
 		{"Artifact read", "Artifact", `{"action":"read","url":"https://claude.ai/code/artifact/abc"}`, "read https://claude.ai/code/artifact/abc"},
 		{"Artifact list", "Artifact", `{"action":"list"}`, "list"},
+		{"SubagentHandback", "SubagentHandback", `{"message":"## Unison: report\n\nAll 6 snippets pass."}`, "## Unison: report\n\nAll 6 snippets pass."},
+		{"CronDelete", "CronDelete", `{"id":"0d4716b9"}`, "cron 0d4716b9"},
+		{"SendFeedback", "SendFeedback", `{"type":"bug","title":"Picker needs a mouse","details":"- **What happened:** ..."}`, "Picker needs a mouse"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			got := formatToolInput(tc.tool, json.RawMessage(tc.input))
 			if got != tc.want {
 				t.Errorf("formatToolInput(%s) = %q, want %q", tc.tool, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseLine_HookAttachments(t *testing.T) {
+	tests := []struct {
+		name     string
+		line     string
+		hookName string
+		want     string
+	}{
+		{
+			"additional context",
+			`{"type":"attachment","timestamp":"2026-09-19T22:45:11Z","sessionId":"s","attachment":{"type":"hook_additional_context","content":["first note","second note"],"hookName":"UserPromptSubmit","toolUseID":"hook-1","hookEvent":"UserPromptSubmit"}}`,
+			"UserPromptSubmit",
+			"first note\nsecond note",
+		},
+		{
+			"blocking error",
+			`{"type":"attachment","timestamp":"2026-09-19T22:41:11Z","sessionId":"s","attachment":{"type":"hook_blocking_error","hookName":"Stop","toolUseID":"t","hookEvent":"Stop","blockingError":{"blockingError":"no test ran after the last edit","command":"check claims"}}}`,
+			"Stop",
+			"blocked: no test ran after the last edit",
+		},
+		{
+			"non-blocking error",
+			`{"type":"attachment","timestamp":"2026-09-19T22:22:45Z","sessionId":"s","attachment":{"type":"hook_non_blocking_error","hookName":"PreToolUse:Write","toolUseID":"t","hookEvent":"PreToolUse","stderr":"ENOENT: no such file\n","stdout":"","exitCode":1,"command":"check edit","durationMs":7}}`,
+			"PreToolUse:Write",
+			"error (exit 1): ENOENT: no such file",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			items, err := ParseLine(tc.line)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(items) != 1 || items[0].Type != TypeHookOutput {
+				t.Fatalf("expected 1 hook item, got %+v", items)
+			}
+			if items[0].ToolName != tc.hookName {
+				t.Errorf("toolName = %q, want %q", items[0].ToolName, tc.hookName)
+			}
+			if items[0].Content != tc.want {
+				t.Errorf("content = %q, want %q", items[0].Content, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseLine_HookAttachments_EmptyDropped(t *testing.T) {
+	lines := []string{
+		`{"type":"attachment","timestamp":"2026-09-19T22:45:11Z","sessionId":"s","attachment":{"type":"hook_additional_context","content":[],"hookName":"UserPromptSubmit"}}`,
+		`{"type":"attachment","timestamp":"2026-09-19T22:41:11Z","sessionId":"s","attachment":{"type":"hook_blocking_error","hookName":"Stop","blockingError":{"blockingError":""}}}`,
+	}
+	for _, line := range lines {
+		items, _ := ParseLine(line)
+		if len(items) != 0 {
+			t.Errorf("expected 0 items, got %+v for %s", items, line)
+		}
+	}
+}
+
+func TestParseLine_ModelRefusal(t *testing.T) {
+	line := `{"type":"system","subtype":"model_refusal_no_fallback","content":"","level":"warning","originalModel":"claude-opus-5[1m]","requestId":"req_1","apiRefusalCategory":"cyber","apiRefusalExplanation":"blocked","isMeta":false,"timestamp":"2026-09-15T12:34:01Z","sessionId":"s"}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 || items[0].Type != TypeSessionEvent {
+		t.Fatalf("expected 1 session event, got %+v", items)
+	}
+	if items[0].ToolName != "refused" || items[0].Content != "cyber (opus-5[1m])" {
+		t.Errorf("got label=%q detail=%q", items[0].ToolName, items[0].Content)
+	}
+}
+
+func TestParseLine_ScheduledTaskFire(t *testing.T) {
+	tests := []struct {
+		name string
+		line string
+		want string
+	}{
+		{"cron and prompt", `{"type":"system","subtype":"scheduled_task_fire","content":"Running scheduled task (Sep 22 8:10am)","timestamp":"2026-09-22T12:10:57Z","sessionId":"s","taskId":"0d4716b9","cron":"*/5 * * * *","prompt":"check the deploy"}`, "*/5 * * * *: check the deploy"},
+		{"content fallback", `{"type":"system","subtype":"scheduled_task_fire","content":"Running scheduled task (Sep 22 8:10am)","timestamp":"2026-09-22T12:10:57Z","sessionId":"s"}`, "Running scheduled task (Sep 22 8:10am)"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			items, err := ParseLine(tc.line)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(items) != 1 || items[0].Type != TypeSessionEvent || items[0].ToolName != "scheduled task" {
+				t.Fatalf("expected 1 scheduled task event, got %+v", items)
+			}
+			if items[0].Content != tc.want {
+				t.Errorf("detail = %q, want %q", items[0].Content, tc.want)
+			}
+		})
+	}
+}
+
+// Session-start echoes, cache telemetry and per-stop hook summaries are
+// deliberately left dropped.
+func TestParseLine_V013Dropped(t *testing.T) {
+	lines := map[string]string{
+		"date":                  `{"type":"attachment","timestamp":"2026-09-13T17:11:58Z","sessionId":"s","attachment":{"type":"date","date":"2026-09-13"}}`,
+		"environment":           `{"type":"attachment","timestamp":"2026-09-13T17:11:58Z","sessionId":"s","attachment":{"type":"environment","snapshot":{"workingDirectory":"/x"}}}`,
+		"instructions":          `{"type":"attachment","timestamp":"2026-09-13T17:11:58Z","sessionId":"s","attachment":{"type":"instructions","files":[{"path":"/x/CLAUDE.md","type":"Project","content":"# X"}]}}`,
+		"model":                 `{"type":"attachment","timestamp":"2026-09-13T17:11:58Z","sessionId":"s","attachment":{"type":"model","identity":{"modelId":"claude-opus-5[1m]"},"text":"You are powered by Opus 5."}}`,
+		"session_context":       `{"type":"attachment","timestamp":"2026-09-13T17:11:58Z","sessionId":"s","attachment":{"type":"session_context","context":{"gitStatus":"clean"}}}`,
+		"prompt_snapshot":       `{"type":"attachment","timestamp":"2026-09-13T17:11:58Z","sessionId":"s","attachment":{"type":"prompt_snapshot","systemPrompt":["You are an agent"]}}`,
+		"deferred_tools_record": `{"type":"attachment","timestamp":"2026-09-13T17:11:58Z","sessionId":"s","attachment":{"type":"deferred_tools_record","entries":[{"name":"WebFetch"}]}}`,
+		"thinking_stripped":     `{"type":"attachment","timestamp":"2026-09-12T13:53:43Z","sessionId":"s","attachment":{"type":"thinking_stripped","scope":"all"}}`,
+		"thinking_drop":         `{"type":"attachment","timestamp":"2026-09-18T00:49:32Z","sessionId":"s","attachment":{"type":"thinking_drop","model":"claude-fable-5-1","thinkingBlocksSent":14}}`,
+		"opened_file_in_ide":    `{"type":"attachment","timestamp":"2026-09-18T00:46:11Z","sessionId":"s","attachment":{"type":"opened_file_in_ide","filename":"/x/cpu.rs"}}`,
+		"stop_hook_summary":     `{"type":"system","subtype":"stop_hook_summary","hookCount":1,"hookInfos":[{"command":"c","durationMs":561}],"hookErrors":[],"preventedContinuation":false,"level":"suggestion","timestamp":"2026-09-19T22:30:48Z","sessionId":"s"}`,
+		"fork-context-ref":      `{"type":"fork-context-ref","agentId":"af476ef8d89ec8227","parentSessionId":"p","parentLastUuid":"u","contextLength":82}`,
+	}
+	for name, line := range lines {
+		t.Run(name, func(t *testing.T) {
+			items, err := ParseLine(line)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(items) != 0 {
+				t.Fatalf("expected 0 items, got %+v", items)
 			}
 		})
 	}

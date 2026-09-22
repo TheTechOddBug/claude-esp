@@ -125,6 +125,13 @@ type RawMessage struct {
 	TotalDuration     int64                 `json:"totalDuration,omitempty"`
 	StartTime         int64                 `json:"startTime,omitempty"`
 	ModelUsage        map[string]ModelUsage `json:"modelUsage,omitempty"`
+	// Refusal fields (system.model_refusal_no_fallback).
+	OriginalModel      string `json:"originalModel,omitempty"`
+	APIRefusalCategory string `json:"apiRefusalCategory,omitempty"`
+	// Scheduled-task fields (system.scheduled_task_fire): the cron expression
+	// and the prompt it injected.
+	Cron   string `json:"cron,omitempty"`
+	Prompt string `json:"prompt,omitempty"`
 }
 
 // ModelUsage is one model's entry in cost-state.modelUsage. Only the cost is
@@ -152,13 +159,17 @@ type Attachment struct {
 	Type      string `json:"type"`
 	HookName  string `json:"hookName,omitempty"`
 	HookEvent string `json:"hookEvent,omitempty"`
-	// Content is omitted because subtypes disagree on its shape
-	// (hook_success: string; task_reminder: array). Use Stdout for hooks.
-	Stdout     string `json:"stdout,omitempty"`
-	Stderr     string `json:"stderr,omitempty"`
-	Command    string `json:"command,omitempty"`
-	ExitCode   int    `json:"exitCode,omitempty"`
-	DurationMs int64  `json:"durationMs,omitempty"`
+	// Content stays raw because subtypes disagree on its shape
+	// (hook_success: string; hook_additional_context: []string;
+	// task_reminder: array of objects). Use Stdout for hook_success.
+	Content    json.RawMessage `json:"content,omitempty"`
+	Stdout     string          `json:"stdout,omitempty"`
+	Stderr     string          `json:"stderr,omitempty"`
+	Command    string          `json:"command,omitempty"`
+	ExitCode   int             `json:"exitCode,omitempty"`
+	DurationMs int64           `json:"durationMs,omitempty"`
+	// hook_blocking_error nests the message one level down.
+	BlockingError *HookBlockingError `json:"blockingError,omitempty"`
 	// Diagnostics fields (attachment.type=diagnostics)
 	Files []DiagnosticFile `json:"files,omitempty"`
 	// plan_mode_exit
@@ -176,6 +187,12 @@ type Attachment struct {
 	Description  string `json:"description,omitempty"`
 	Status       string `json:"status,omitempty"`
 	DeltaSummary string `json:"deltaSummary,omitempty"`
+}
+
+// HookBlockingError is the payload on attachment.hook_blocking_error.
+type HookBlockingError struct {
+	BlockingError string `json:"blockingError,omitempty"`
+	Command       string `json:"command,omitempty"`
 }
 
 // DiagnosticFile is one file's worth of LSP diagnostics.
@@ -282,6 +299,10 @@ type ToolInput struct {
 	// Artifact
 	Action string `json:"action,omitempty"`
 	URL    string `json:"url,omitempty"`
+	// CronDelete
+	ID string `json:"id,omitempty"`
+	// SendFeedback
+	Title string `json:"title,omitempty"`
 }
 
 // ToolInputQuestion is one entry in AskUserQuestion's questions array.
@@ -393,9 +414,13 @@ func debugItem(raw RawMessage, line string, timestamp time.Time) StreamItem {
 	}
 }
 
-// parseAttachment dispatches on attachment.type. Surfaces hook_success and
-// diagnostics; every other subtype is intentionally dropped (the DebugAll
-// flag will surface the rest as TypeDebug items).
+// parseAttachment dispatches on attachment.type. Surfaces hook results,
+// diagnostics and a handful of session-state changes; every other subtype is
+// intentionally dropped (the DebugAll flag will surface the rest as TypeDebug
+// items). Notably dropped: the session-start context echoes (date,
+// environment, instructions, model, session_context, prompt_snapshot,
+// deferred_tools_record), thinking_stripped/thinking_drop cache telemetry,
+// and opened_file_in_ide.
 func parseAttachment(raw RawMessage, timestamp time.Time) []StreamItem {
 	if raw.Attachment == nil {
 		return nil
@@ -415,6 +440,16 @@ func parseAttachment(raw RawMessage, timestamp time.Time) []StreamItem {
 			Content:    body,
 			DurationMs: raw.Attachment.DurationMs,
 		}}
+	case "hook_additional_context":
+		if body := hookContextBody(raw.Attachment.Content); body != "" {
+			return hookItem(raw, timestamp, agentName, body)
+		}
+	case "hook_blocking_error":
+		if b := raw.Attachment.BlockingError; b != nil && b.BlockingError != "" {
+			return hookItem(raw, timestamp, agentName, "blocked: "+b.BlockingError)
+		}
+	case "hook_non_blocking_error":
+		return hookItem(raw, timestamp, agentName, hookErrorBody(raw.Attachment))
 	case "diagnostics":
 		return diagnosticsItems(raw, timestamp, agentName)
 	case "plan_mode_exit":
@@ -446,6 +481,43 @@ func parseAttachment(raw RawMessage, timestamp time.Time) []StreamItem {
 		}
 	}
 	return nil
+}
+
+// hookItem builds a TypeHookOutput item for a hook attachment, labelled by
+// the hook name (e.g. "PreToolUse:Write") so it renders like hook_success.
+func hookItem(raw RawMessage, timestamp time.Time, agentName, body string) []StreamItem {
+	return []StreamItem{{
+		Type:       TypeHookOutput,
+		SessionID:  raw.SessionID,
+		AgentID:    raw.AgentID,
+		AgentName:  agentName,
+		Timestamp:  timestamp,
+		ToolName:   raw.Attachment.HookName,
+		Content:    body,
+		DurationMs: raw.Attachment.DurationMs,
+	}}
+}
+
+// hookContextBody joins hook_additional_context's content, which is a list
+// of strings. Returns "" for an empty or differently-shaped payload.
+func hookContextBody(content json.RawMessage) string {
+	var parts []string
+	if err := json.Unmarshal(content, &parts); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n"))
+}
+
+// hookErrorBody renders a hook_non_blocking_error as "error (exit N): <stderr>".
+func hookErrorBody(a *Attachment) string {
+	head := "error"
+	if a.ExitCode != 0 {
+		head = fmt.Sprintf("error (exit %d)", a.ExitCode)
+	}
+	if msg := strings.TrimSpace(a.Stderr); msg != "" {
+		return head + ": " + msg
+	}
+	return head
 }
 
 // taskStatusDetail joins a task_status attachment's description and delta
@@ -716,6 +788,11 @@ func parseSessionTitle(raw RawMessage, timestamp time.Time, title string) []Stre
 //   - subtype=local_command → TypeSessionEvent (slash command invoked)
 //   - subtype=informational → TypeSessionEvent (transient notice, e.g. backgrounding)
 //   - subtype=agents_killed → TypeSessionEvent (subagents terminated)
+//   - subtype=model_refusal_no_fallback → TypeSessionEvent (request refused)
+//   - subtype=scheduled_task_fire → TypeSessionEvent (cron / loop job fired)
+//
+// stop_hook_summary is dropped: it fires on every stop, and the interesting
+// case (a hook blocking the stop) arrives as attachment.hook_blocking_error.
 //
 // Other subtypes are intentionally dropped.
 func parseSystemMessage(raw RawMessage, timestamp time.Time) []StreamItem {
@@ -767,8 +844,42 @@ func parseSystemMessage(raw RawMessage, timestamp time.Time) []StreamItem {
 		return nil
 	case "agents_killed":
 		return sessionEvent(raw, timestamp, agentName, "agents killed", "")
+	case "model_refusal_no_fallback":
+		return sessionEvent(raw, timestamp, agentName, "refused", refusalDetail(raw))
+	case "scheduled_task_fire":
+		return sessionEvent(raw, timestamp, agentName, "scheduled task", scheduledTaskDetail(raw))
 	}
 	return nil
+}
+
+// refusalDetail renders a refusal as "<category> (<model>)", with either
+// part omitted when absent.
+func refusalDetail(raw RawMessage) string {
+	model := ""
+	if raw.OriginalModel != "" {
+		model = shortModelName(raw.OriginalModel)
+	}
+	switch {
+	case raw.APIRefusalCategory != "" && model != "":
+		return fmt.Sprintf("%s (%s)", raw.APIRefusalCategory, model)
+	case raw.APIRefusalCategory != "":
+		return raw.APIRefusalCategory
+	default:
+		return model
+	}
+}
+
+// scheduledTaskDetail renders "<cron>: <prompt>", falling back to the line's
+// own "Running scheduled task (…)" content when the prompt is missing.
+func scheduledTaskDetail(raw RawMessage) string {
+	switch {
+	case raw.Cron != "" && raw.Prompt != "":
+		return raw.Cron + ": " + raw.Prompt
+	case raw.Prompt != "":
+		return raw.Prompt
+	default:
+		return raw.Content
+	}
 }
 
 // localCommandDetail renders a system.local_command body into "/name args".
@@ -1142,6 +1253,21 @@ func formatToolInput(toolName string, inputRaw json.RawMessage) string {
 		return string(inputRaw)
 	case "ListAgents":
 		return "(list agents)"
+	case "SubagentHandback":
+		if input.Message != "" {
+			return input.Message
+		}
+		return string(inputRaw)
+	case "CronDelete":
+		if input.ID != "" {
+			return "cron " + input.ID
+		}
+		return string(inputRaw)
+	case "SendFeedback":
+		if input.Title != "" {
+			return input.Title
+		}
+		return string(inputRaw)
 	case "Artifact":
 		action := input.Action
 		if action == "" {
